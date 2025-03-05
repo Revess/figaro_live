@@ -18,7 +18,9 @@ setup(
         "torch~=2.1.2",
         "torchtext~=0.16.2",
         "transformers~=4.37.0",
-        "ipykernel"
+        "ipykernel",
+        "mido",
+        "python-rtmidi"
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
