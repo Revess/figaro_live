@@ -331,6 +331,9 @@ def AI_host():
                 if torch.all(is_done):
                     start_playing = False
                     break
+            import pickle as pkl
+            with open('./test.pkl', 'wb') as f:
+                pkl.dump(x.clone().detach().cpu())
 
             played_notes = []
             played_clicks = []
