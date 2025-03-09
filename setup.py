@@ -20,7 +20,8 @@ setup(
         "transformers~=4.37.0",
         "ipykernel",
         "mido",
-        "python-rtmidi"
+        "python-rtmidi",
+        "py_midicsv"
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
