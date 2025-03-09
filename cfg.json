@@ -1,9 +1,11 @@
 {
-    "MIDI_IN": "Launchkey Mini MK3:Launchkey Mini MK3 Launchkey Mi 24:0",
-    "MIDI_OUT": "FLUID Synth (145196):Synth input port (145196:0) 128:0",
+    "MIDI_IN": "Launchkey Mini MK3 MIDI Port",
+    "MIDI_OUT": "IAC Driver Bus 1",
     "METER": 4,
-    "MAX_BARS": 2,
+    "MAX_BARS": 4,
     "MAX_NOTES": 256,
     "MAX_MEASURES": 2,
-    "PPQN": 24
+    "PPQN": 24,
+    "VERBOSE": true,
+    "TEMPERATURE": 1.2
 }
