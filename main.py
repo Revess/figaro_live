@@ -9,6 +9,12 @@ from copy import deepcopy
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dataclasses import dataclass
 
+import transformers
+import warnings
+
+warnings.filterwarnings("ignore", message=".*attention mask and the pad token id.*")
+transformers.logging.set_verbosity_error()
+
 @dataclass
 class Note():
     start: float
@@ -55,6 +61,7 @@ def conv_velocity(velocity):
         48: "!",
         60: "@",
         100: "#",
+        127: "$",
     }
     if isinstance(velocity, int):
         for i in velocity_map.keys():
@@ -70,28 +77,6 @@ def conv_velocity(velocity):
     else:
         raise "Wrong type for velocity"
 
-def conv_pm_to_str(midi_):
-    ticks_per_beat = 480 / 24
-    bpm = ((60) / 120) *  1000000
-
-    rel_notes = []
-    last_time = 0
-
-    for msg in midi_:
-        delta = msg.end - msg.start
-        rel_notes.append(
-            str(mido.second2tick(msg.start - last_time, ticks_per_beat, bpm)) +
-            str(conv_velocity(msg.velocity)) +
-            str(mido.second2tick(delta, ticks_per_beat, bpm)) +
-            str(conv_channel(msg.channel)) +
-            str(msg.pitch) + "|"
-        )
-
-        last_time = msg.start
-
-    str_conv = ''.join(rel_notes)
-    return str_conv
-
 def transport(send_pipe, recv_pipe):
     with open('./cfg.json', 'r') as f:
         cfg = json.load(f)
@@ -101,60 +86,53 @@ def transport(send_pipe, recv_pipe):
     METER = cfg['METER']
     MAX_BARS = cfg['MAX_BARS']
     VERBOSE = cfg['VERBOSE']
-    start_time = time.time()
-    tick_start = time.time()
-    tick = avg_delta = beat = 0
+
+    abs_time = None
+    tick_start = None
+
     active_notes = {}
     active_ai_notes = {}
-    bars_played_user = 0
-    bars_played_ai = 0
-    send_to_ai = False
+
+    active_player_bars = 0
+    active_ai_bars = -1
+    last_tick_time = 0
     notes_to_play = []
-    sort = False
-    ai_turn = False
+    tempo_mics = 1
 
     with mido.open_input(MIDI_IN) as inport, mido.open_output(MIDI_OUT) as outport:
+        avg_delta = 0
+        tick = 0
+        beat = 0
         for msg in inport:
             if recv_pipe.poll(0.001):
-                res = recv_pipe.recv()
-                if isinstance(res, str):
-                    if res == 'done':
-                        send_to_ai = False
-                        bars_played_user = 0
-                elif isinstance(res, Note):
-                    if ai_turn:
-                        notes_to_play.append((
-                            res.start,
-                            'note_on',
-                            note
-                        ))
-                        notes_to_play.append((
-                            res.end,
-                            'note_of',
-                            note
-                        ))
-                    sort = True
-
-            if sort:
-                notes_to_play.sort(key=lambda event: event[0])
-                sort = False
-
+                data = recv_pipe.recv()
+                notes_to_play.append(mido.Message('note_on', note=data.pitch, velocity=data.velocity, channel=0, time=mido.tick2second(data.start, PPQN, tempo_mics)))
+                notes_to_play.append(mido.Message('note_off', note=data.pitch, velocity=data.velocity, channel=0, time=mido.tick2second(data.start + data.end, PPQN, tempo_mics)))
+                notes_to_play.sort(key = lambda x: x.time)
+            # Handle pipe inputs
             if msg.type == 'clock':
+                if abs_time is None:
+                    abs_time = time.time()
+                if tick_start is None:
+                    tick_start = time.time()
+
                 delta = time.time() - tick_start
                 avg_delta += delta
 
                 if (tick + 1) % PPQN == 0:
                     tick = 0
                     bpm = round(60 / avg_delta, 0)
+                    tempo_mics = (60 / bpm) * 1000000
                     avg_delta = 0
 
-                    time_ = time.time() - start_time
+                    time_ = time.time() - abs_time
                     if beat % METER == 0:
                         pitch = 75
-                        if bars_played_user >= 1:
-                            bars_played_user += 1
-                        if bars_played_ai >= 1:
-                            bars_played_ai += 1
+                        last_tick_time = mido.second2tick(time_, PPQN, (60 / bpm) * 1000000) - PPQN
+                        if active_player_bars > 0:
+                            active_player_bars += 1
+                        if active_ai_bars >= 0:
+                            active_ai_bars += 1
                     else:
                         pitch = 56
 
@@ -164,17 +142,23 @@ def transport(send_pipe, recv_pipe):
 
                     # Sending notes
                     if VERBOSE:
-                        print('click', bars_played_ai, bars_played_user)
                         outport.send(mido.Message('note_on', note=pitch, velocity=100, channel=9))
                         time.sleep(0.01)
                         outport.send(mido.Message('note_off', note=pitch, velocity=100, channel=9))
-
                     
                     note = Note(
                         velocity=100,
                         pitch=pitch,
-                        start=mido.second2tick(time_, 480 / PPQN, bpm),
-                        end=mido.second2tick(time_ + (60 / bpm), 480 / PPQN, bpm),
+                        start=mido.second2tick(
+                            time_, 
+                            PPQN, 
+                            tempo_mics
+                        ),
+                        end=mido.second2tick(
+                            time_ + (60 / bpm), 
+                            PPQN, 
+                            tempo_mics
+                        ),
                         channel=9
                     )
 
@@ -183,158 +167,196 @@ def transport(send_pipe, recv_pipe):
                 tick += 1
                 tick_start = time.time()
 
-            if bars_played_user == MAX_BARS + 1 and not send_to_ai:
-                send_pipe.send('start_ai')
-                send_to_ai = True
-                ai_turn = True
+            if active_player_bars == MAX_BARS + 1:
+                for note, (start, velocity) in active_notes.items():
+                    note = Note(
+                        velocity=velocity,
+                        pitch=note,
+                        start=mido.second2tick(
+                            start, 
+                            PPQN, 
+                            tempo_mics
+                        ),
+                        end=mido.second2tick(
+                            time.time() - abs_time, 
+                            PPQN, 
+                            tempo_mics
+                        ),
+                        channel=0
+                    )
+
+                    send_pipe.send(('piano', note))
+                send_pipe.send(('start_ai', last_tick_time))
+                active_ai_bars = 0
+                notes_to_play = []
+                active_player_bars = -1
             
-            if bars_played_ai == MAX_BARS + 1:
-                send_pipe.send('bar_end')
-                bars_played_ai = 0 
+            if active_ai_bars == MAX_BARS + 1:
+                send_pipe.send(('stop_ai', ''))
                 for note_ in notes_to_play[:]:
-                    if note_[1] == 'note_off' and note_[-1].velocity == 0 and note_[-1] in active_ai_notes.keys():
-                        start, velocity = active_notes.pop(note_[-1].pitch)
-                        outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity))
+                    if note_.type == 'note_off' and note_.velocity == 0 and note_.note in active_ai_notes.keys():
+                        start, velocity = active_notes.pop(note_.note)
+                        outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
                         notes_to_play.remove(note_)
                         note = Note(
                             velocity=velocity,
                             pitch=msg.note,
-                            start=mido.second2tick(start, 480 / PPQN, bpm),
-                            end=mido.second2tick((time.time() - start_time), 480 / PPQN, bpm),
+                            start=mido.second2tick(start, PPQN, tempo_mics),
+                            end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
                             channel=0
                         )
 
                         send_pipe.send(('piano', note))
+                active_ai_bars = -1
+                active_player_bars = 0
                 notes_to_play = []
-                ai_turn = False
-                
-            if msg.type == 'note_on' and msg.velocity > 0 and not send_to_ai:
-                bars_played_ai = 0
-                outport.send(msg)
-                active_notes[msg.note] = ((time.time() - start_time), msg.velocity)
-                if bars_played_user == 0:
-                    bars_played_user += 1
 
-            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0) and msg.note in active_notes.keys() and not send_to_ai:
-                outport.send(msg)
-                start, velocity = active_notes.pop(msg.note)
-                note = Note(
-                    velocity=velocity,
-                    pitch=msg.note,
-                    start=mido.second2tick(start, 480 / PPQN, bpm),
-                    end=mido.second2tick((time.time() - start_time), 480 / PPQN, bpm),
-                    channel=0
-                )
+            if msg.type in ['note_on', 'note_off']:
 
-                send_pipe.send(('piano', note))
+                if msg.type == 'note_on' and msg.velocity > 0 and active_player_bars >= 0 and active_player_bars <= MAX_BARS:
+                    active_notes[msg.note] = (time.time() - abs_time, msg.velocity)
+                    outport.send(msg)
+                    if active_player_bars == 0:
+                        active_player_bars += 1
 
-            if ai_turn:
+                elif msg.type == 'note_off' or msg.velocity == 0 and msg.note in active_notes and active_player_bars >= 0 and active_player_bars <= MAX_BARS:
+                    outport.send(msg)
+                    start, velocity = active_notes.pop(msg.note)
+                    note = Note(
+                        velocity=velocity,
+                        pitch=msg.note,
+                        start=mido.second2tick(
+                            start, 
+                            PPQN, 
+                            tempo_mics
+                        ),
+                        end=mido.second2tick(
+                            time.time() - abs_time, 
+                            PPQN, 
+                            tempo_mics
+                        ),
+                        channel=0
+                    )
+
+                    send_pipe.send(('piano', note))
+
+            if active_ai_bars >= 0:
                 for note_ in notes_to_play[:]:
-                    if note_[0] < (time.time() - start_time):
-                        if note_[1] == 'note_on' and note_[-1].velocity > 0:
-                            active_ai_notes[note_[-1].pitch] = ((time.time() - start_time), note_[-1].velocity)
-                            outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity))
+                    if note_.time < (time.time() - abs_time):
+                        if note_.type == 'note_on' and note_.velocity > 0:
+                            active_ai_notes[note_.note] = ((time.time() - abs_time), note_.velocity)
+                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
                             notes_to_play.remove(note_)
-                        if note_[1] == 'note_off' and note_[-1].velocity == 0 and note_[-1] in active_ai_notes.keys():
-                            start, velocity = active_notes.pop(note_[-1].pitch)
-                            outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity))
+                        if note_.type == 'note_off' and note_.velocity == 0 and note_.note in active_ai_notes.keys():
+                            start, velocity = active_notes.pop(note_.note)
+                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
                             notes_to_play.remove(note_)
                             note = Note(
                                 velocity=velocity,
                                 pitch=msg.note,
-                                start=mido.second2tick(start, 480 / PPQN, bpm),
-                                end=mido.second2tick((time.time() - start_time), 480 / PPQN, bpm),
+                                start=mido.second2tick(start, PPQN, tempo_mics),
+                                end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
                                 channel=0
                             )
 
                             send_pipe.send(('piano', note))
-                        if bars_played_ai == 0:
-                            bars_played_ai += 1
 
 def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
     piano_notes = []
     click_notes = []
-    ORG_OFFSET = 0.0
-    init_offset = 0
-    get_next_offset = False
+    max_notes_ctx = 16
+    last_tick_time = 0
+
     while True:
         if receive_AI.poll(0.001):
-            data = receive_AI.recv()
-            if isinstance(data, Note):
-                if data.channel == 0:
-                    data.start += init_offset
-                    data.end += data.start
-                    init_offset = data.start
-                    send_transport.send(data)
+            decoded = receive_AI.recv()
+            pattern = re.compile(r"(\d+)(\D)(\d+)(\D)(\d+)\|")
+            m = pattern.match(decoded)
+            decoded = Note(
+                start = int(m.group(1)) + last_tick_time,
+                velocity = conv_velocity(m.group(2)),
+                end = int(m.group(3)),
+                channel = conv_channel(m.group(4)),
+                pitch = int(m.group(5))
+            )
+            print(decoded)
+            last_tick_time = decoded.start # Offset moves to the next prev note!
+            if decoded.channel == 0:
+                send_transport.send(decoded)
         if recv_transport.poll(0.001):
-            data = recv_transport.recv()
-            if isinstance(data, str):
-                if data == 'start_ai':
-                    init_offset = ORG_OFFSET
-                    get_next_offset = True
-                    piano_rel = deepcopy(piano_notes)
-                    click_rel = deepcopy(click_notes)
+            k, v = recv_transport.recv()
+            if k == 'click':
+                click_notes.append(v)
+            elif k == 'piano':
+                br = False
+                for note in piano_notes:
+                    if note.pitch == v.pitch and note.velocity == v.velocity and note.start == v.start and note.channel == v.channel and note.end < v.end: # Case where the actual note end is different
+                        print('found one!')
+                        note.end = v.end
+                        br = True
+                        break
+                if not br:
+                    piano_notes.append(v)
+            elif k == 'stop_ai':
+                send_AI.send('stop_ai')
+            elif k == 'start_ai':
+                last_tick_time = v
+                piano_notes.sort(key = lambda x: x.start)
+                click_notes.sort(key = lambda x: x.start)
+                piano_notes = piano_notes[-max_notes_ctx:]
+                print(len(piano_notes))
+
+                break_point = 0
+                for step, click_ in enumerate(click_notes):
+                    if click_.start > piano_notes[0].start:
+                        break_point = step - 1
+                        break
+                for i in range(break_point):
+                    click_notes.pop(0)
+
+                piano_rel = deepcopy(piano_notes)
+                click_rel = deepcopy(click_notes)
+
+                for note in piano_rel:
+                    note.start -= click_rel[0].start
+                for note in click_rel:
+                    note.start -= click_rel[0].start
+
+                midi_ = []
+                for note in piano_rel:
+                    midi_.append(Note(
+                        start = note.start,
+                        end = note.end,
+                        pitch = note.pitch,
+                        velocity = note.velocity,
+                        channel = 0
+                    ))
+                # test without the clicks
+                # for note in click_rel:
+                #     midi_.append(Note(
+                #         start = note.start,
+                #         end = note.end,
+                #         pitch = note.pitch,
+                #         velocity = note.velocity,
+                #         channel = 9
+                #     ))
+
+                midi_.sort(key = lambda x: x.start)
+
+                midi_str = '. classical |'
+                last_time = 0
+                for note in midi_:
+                    midi_str += str(note.start - last_time) + \
+                        str(conv_velocity(note.velocity)) + \
+                        str(note.end - note.start) + \
+                        str(conv_channel(note.channel)) + \
+                        str(note.pitch) + "|"
+                    last_time = note.start
+                with open('./test.txt', 'w') as f:
+                    f.write(midi_str)
                 
-                    # Do one last time filter round
-                    break_point = 0
-                    for step, click_ in enumerate(click_rel):
-                        if click_.start > piano_rel[0].start:
-                            break_point = step - 1
-                            break
-                    for i in range(break_point):
-                        click_rel.pop(0)
-
-                    piano_track = []
-                    click_track = []
-
-                    for note in piano_rel:
-                        note.start -= ORG_OFFSET
-                        piano_track.append(note)
-                    for note in click_rel:
-                        note.start -= ORG_OFFSET
-                        click_track.append(note)
-
-                    midi_ = []
-                    for note in piano_track:
-                        midi_.append(Note(
-                            start = note.start,
-                            end = note.end,
-                            pitch = note.pitch,
-                            velocity = note.velocity,
-                            channel = 0
-                        ))
-                    for note in click_track:
-                        midi_.append(Note(
-                            start = note.start,
-                            end = note.end,
-                            pitch = note.pitch,
-                            velocity = note.velocity,
-                            channel = 9
-                        ))
-
-                    midi_.sort(key = lambda x: x.start)
-                    pm = conv_pm_to_str(midi_)
-                    send_AI.send(pm)
-                elif data == 'bar_end':
-                    send_AI('done')
-                # send_transport.send('done')
-            elif isinstance(data, tuple):
-                if data[0] == 'click':
-                    if get_next_offset:
-                        ORG_OFFSET = data[1].start
-                        get_next_offset = False
-                    click_notes.append(data[1])
-                else:
-                    piano_notes.append(data[1])
-                    piano_notes = piano_notes[-256:] # Filter so the piano_notes at most get a ctx of -256
-                    break_point = 0
-                    for step, click_ in enumerate(click_notes):
-                        if click_.start > piano_notes[0].start:
-                            break_point = step - 1
-                            break
-                    for i in range(break_point):
-                        click_notes.pop(0)
-            # print(len(piano_notes), len(click_notes), click_notes[-1].start)
+                send_AI.send(midi_str)
+        time.sleep(0.001)
 
 def AI_Processor(send_pipe, recv_pipe):
     with open('./cfg.json', 'r') as f:
@@ -343,56 +365,44 @@ def AI_Processor(send_pipe, recv_pipe):
     model_name = "kobimusic/esecutore-4-0619"
     DEVICE = 'cuda' if torch.cuda.is_available() else 'mps'
     temperature = cfg['TEMPERATURE']
-    initial_prompt = 1
-    max_iter = 16000
     max_notes_ctx = 512
 
     model = AutoModelForCausalLM.from_pretrained(model_name)
     model.to('mps')
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model.to(DEVICE)
+    print('loaded')
 
     while True:
         tokens = recv_pipe.recv()
-        print(tokens)
+        ins = tokenizer.encode(tokens)
+        ins = torch.tensor([ins], device=DEVICE)
         while True:
             if recv_pipe.poll(0.001):
                 data = recv_pipe.recv()
-                if data == 'done':
+                print(data)
+                if data == 'stop_ai':
                     break
-            tokens = f". pop |{tokens}"
-            ins = tokenizer.encode(tokens)
-            ins = torch.tensor([ins], device=DEVICE)
             res = model.generate(
                 ins,
                 use_cache=False,
                 max_new_tokens=6,
                 do_sample=True,
-                temperature=0.89,
+                temperature=1.2,
                 top_p=1.0,
                 num_return_sequences=1,
             )
             decoded = tokenizer.batch_decode(res[:, ins.shape[1]:])[0]
-            print(decoded)
-            pattern = re.compile(r"(\d+)(\D)(\d+)(\D)(\d+)\|")
-            m = pattern.match(decoded)
-            decoded = Note(
-                start = int(m.group(1)),
-                velocity = conv_velocity(m.group(2)),
-                end = int(m.group(3)),
-                channel = conv_channel(m.group(4)),
-                pitch = int(m.group(5))
-            )
             send_pipe.send(decoded)
             ins = torch.cat((ins, res[:, ins.shape[1]:]), dim=1)
-            if ins.shape[1] > max_notes_ctx:
-                ins = ins[:, -max_notes_ctx:]
 
+        time.sleep(0.001)
             
 
 if __name__ == "__main__":
     p1_to_p2_recv, p1_to_p2_send = multiprocessing.Pipe(duplex=False)
     p2_to_p1_recv, p2_to_p1_send = multiprocessing.Pipe(duplex=False)
+
     p2_to_p3_recv, p2_to_p3_send = multiprocessing.Pipe(duplex=False)
     p3_to_p2_recv, p3_to_p2_send = multiprocessing.Pipe(duplex=False)
     
