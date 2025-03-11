@@ -106,8 +106,7 @@ def transport(send_pipe, recv_pipe):
         for msg in inport:
             if recv_pipe.poll(0.001):
                 data = recv_pipe.recv()
-                notes_to_play.append(mido.Message('note_on', note=data.pitch, velocity=data.velocity, channel=0, time=mido.tick2second(data.start, PPQN, tempo_mics)))
-                notes_to_play.append(mido.Message('note_off', note=data.pitch, velocity=data.velocity, channel=0, time=mido.tick2second(data.start + data.end, PPQN, tempo_mics)))
+                notes_to_play.extend(data)
                 notes_to_play.sort(key = lambda x: x.time)
             # Handle pipe inputs
             if msg.type == 'clock':
@@ -264,25 +263,34 @@ def transport(send_pipe, recv_pipe):
 def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
     piano_notes = []
     click_notes = []
-    max_notes_ctx = 16
+    max_notes_ctx = 128
     last_tick_time = 0
 
     while True:
         if receive_AI.poll(0.001):
             decoded = receive_AI.recv()
-            pattern = re.compile(r"(\d+)(\D)(\d+)(\D)(\d+)\|")
-            m = pattern.match(decoded)
-            decoded = Note(
-                start = int(m.group(1)) + last_tick_time,
-                velocity = conv_velocity(m.group(2)),
-                end = int(m.group(3)),
-                channel = conv_channel(m.group(4)),
-                pitch = int(m.group(5))
-            )
+
             print(decoded)
-            last_tick_time = decoded.start # Offset moves to the next prev note!
-            if decoded.channel == 0:
-                send_transport.send(decoded)
+
+            mido_stack = []
+            for token in decoded.split('|'):
+                pattern = re.compile(r"(\d+)(\D)(\d+)(\D)(\d+)")
+                m = pattern.match(token)
+                if m:
+                    st_time = mido.tick2second(int(m.group(1)) + last_tick_time, 480, 500000)
+                    mido_stack.append(mido.Message(
+                        'note_on', note = int(m.group(5)), velocity = conv_velocity(m.group(2)), time = st_time
+                    ))
+
+                    mido_stack.append(mido.Message(
+                        'note_off', note = int(m.group(5)), velocity = conv_velocity(m.group(2)), time = st_time + mido.tick2second(int(m.group(3)), 480, 500000)
+                    ))
+                
+                last_tick_time += st_time
+            print(mido_stack)
+
+            send_transport.send(mido_stack)
+
         if recv_transport.poll(0.001):
             k, v = recv_transport.recv()
             if k == 'click':
@@ -304,7 +312,6 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                 piano_notes.sort(key = lambda x: x.start)
                 click_notes.sort(key = lambda x: x.start)
                 piano_notes = piano_notes[-max_notes_ctx:]
-                print(len(piano_notes))
 
                 break_point = 0
                 for step, click_ in enumerate(click_notes):
@@ -317,10 +324,12 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                 piano_rel = deepcopy(piano_notes)
                 click_rel = deepcopy(click_notes)
 
-                for note in piano_rel:
+                for note in piano_rel: # Move both abs points over !
                     note.start -= click_rel[0].start
-                for note in click_rel:
-                    note.start -= click_rel[0].start
+                    note.end -= click_rel[0].start
+                # for note in click_rel:
+                #     note.start -= click_rel[0].start
+                #     note.end -= click_rel[0].start
 
                 midi_ = []
                 for note in piano_rel:
@@ -344,16 +353,22 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                 midi_.sort(key = lambda x: x.start)
 
                 midi_str = '. classical |'
-                last_time = 0
+                prev_start = 0
                 for note in midi_:
-                    midi_str += str(note.start - last_time) + \
-                        str(conv_velocity(note.velocity)) + \
-                        str(note.end - note.start) + \
-                        str(conv_channel(note.channel)) + \
-                        str(note.pitch) + "|"
-                    last_time = note.start
-                with open('./test.txt', 'w') as f:
-                    f.write(midi_str)
+                    midi_str += str(note.start - prev_start) + str(conv_velocity(note.velocity)) + str(note.end - note.start) + str(conv_channel(note.channel)) + str(note.pitch) + "|"
+                    prev_start = note.start
+
+                def convert_ppqn(data, factor=20):
+                    # This regex matches a delimiter ($, @, #, or !) followed by one or more digits
+                    def replace_tick(match):
+                        symbol = match.group(1)
+                        tick = int(match.group(2))
+                        return f"{symbol}{int(tick * factor)}"
+                    return re.sub(r'([$@#!])(\d+)', replace_tick, data)
+                midi_str = convert_ppqn(midi_str, factor = 480 // 24)
+
+                # with open('./test.txt', 'w') as f:
+                #     f.write(midi_str)
                 
                 send_AI.send(midi_str)
         time.sleep(0.001)
@@ -361,7 +376,6 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
 def AI_Processor(send_pipe, recv_pipe):
     with open('./cfg.json', 'r') as f:
         cfg = json.load(f)
-    MAX_BARS = cfg['MAX_BARS']
     model_name = "kobimusic/esecutore-4-0619"
     DEVICE = 'cuda' if torch.cuda.is_available() else 'mps'
     temperature = cfg['TEMPERATURE']
@@ -375,8 +389,13 @@ def AI_Processor(send_pipe, recv_pipe):
 
     while True:
         tokens = recv_pipe.recv()
-        ins = tokenizer.encode(tokens)
-        ins = torch.tensor([ins], device=DEVICE)
+        decoded_tokens = tokenizer.encode(tokens)
+        ins = torch.tensor([decoded_tokens], device=DEVICE)
+        attention_mask = torch.ones_like(ins)
+        generated_notes = 0
+        played_ = 0
+        i = 0
+
         while True:
             if recv_pipe.poll(0.001):
                 data = recv_pipe.recv()
@@ -384,20 +403,28 @@ def AI_Processor(send_pipe, recv_pipe):
                 if data == 'stop_ai':
                     break
             res = model.generate(
-                ins,
+                ins[:, i:],
+                attention_mask = attention_mask,
                 use_cache=False,
-                max_new_tokens=6,
+                max_new_tokens=1,
                 do_sample=True,
-                temperature=1.2,
+                temperature=0.89,
                 top_p=1.0,
                 num_return_sequences=1,
             )
-            decoded = tokenizer.batch_decode(res[:, ins.shape[1]:])[0]
-            send_pipe.send(decoded)
-            ins = torch.cat((ins, res[:, ins.shape[1]:]), dim=1)
+            ins = torch.cat((ins, res[:, -1][:, None]), dim=1)
+            i += 1
 
-        time.sleep(0.001)
-            
+            coll = tokenizer.batch_decode(ins[:, len(decoded_tokens) + played_:].cpu().detach())[0]
+
+            if '|' in coll:
+                generated_notes += 1
+                print(coll)
+                send_pipe.send(coll)
+                played_ += ins[:, len(decoded_tokens) + played_:].cpu().detach().shape[1]
+
+
+
 
 if __name__ == "__main__":
     p1_to_p2_recv, p1_to_p2_send = multiprocessing.Pipe(duplex=False)
