@@ -246,13 +246,13 @@ def transport(send_pipe, recv_pipe):
                             active_ai_notes[note_.note] = ((time.time() - abs_time), note_.velocity)
                             outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
                             notes_to_play.remove(note_)
-                        if note_.type == 'note_off' and note_.velocity == 0 and note_.note in active_ai_notes.keys():
-                            start, velocity = active_notes.pop(note_.note)
+                        if note_.type == 'note_off' and note_.note in active_ai_notes.keys():
+                            start, velocity = active_ai_notes.pop(note_.note)
                             outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
                             notes_to_play.remove(note_)
                             note = Note(
                                 velocity=velocity,
-                                pitch=msg.note,
+                                pitch=note_.note,
                                 start=mido.second2tick(start, PPQN, tempo_mics),
                                 end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
                                 channel=0
@@ -277,19 +277,20 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                 pattern = re.compile(r"(\d+)(\D)(\d+)(\D)(\d+)")
                 m = pattern.match(token)
                 if m:
-                    st_time = mido.tick2second(int(m.group(1)) + last_tick_time, 480, 500000)
-                    mido_stack.append(mido.Message(
-                        'note_on', note = int(m.group(5)), velocity = conv_velocity(m.group(2)), time = st_time
-                    ))
+                    if conv_channel(m.group(4)) == 0:
+                        st_time = mido.tick2second(int(m.group(1)) + last_tick_time, 480, 500000)
+                        mido_stack.append(mido.Message(
+                            'note_on', note = int(m.group(5)), velocity = conv_velocity(m.group(2)), time = st_time
+                        ))
 
-                    mido_stack.append(mido.Message(
-                        'note_off', note = int(m.group(5)), velocity = conv_velocity(m.group(2)), time = st_time + mido.tick2second(int(m.group(3)), 480, 500000)
-                    ))
-                
-                last_tick_time += st_time
+                        mido_stack.append(mido.Message(
+                            'note_off', note = int(m.group(5)), velocity = conv_velocity(m.group(2)), time = st_time + mido.tick2second(int(m.group(3)), 480, 500000)
+                        ))
+                    
+                        last_tick_time += st_time
             print(mido_stack)
-
-            send_transport.send(mido_stack)
+            if len(mido_stack) > 0:
+                send_transport.send(mido_stack)
 
         if recv_transport.poll(0.001):
             k, v = recv_transport.recv()
@@ -307,6 +308,8 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                     piano_notes.append(v)
             elif k == 'stop_ai':
                 send_AI.send('stop_ai')
+                piano_notes = []
+                click_notes = []
             elif k == 'start_ai':
                 last_tick_time = v
                 piano_notes.sort(key = lambda x: x.start)
