@@ -244,11 +244,11 @@ def transport(send_pipe, recv_pipe):
                     if note_.time < (time.time() - abs_time):
                         if note_.type == 'note_on' and note_.velocity > 0:
                             active_ai_notes[note_.note] = ((time.time() - abs_time), note_.velocity)
-                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
+                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity, channel=1))
                             notes_to_play.remove(note_)
                         if note_.type == 'note_off' and note_.note in active_ai_notes.keys():
                             start, velocity = active_ai_notes.pop(note_.note)
-                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
+                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity, channel=1))
                             notes_to_play.remove(note_)
                             note = Note(
                                 velocity=velocity,
