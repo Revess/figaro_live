@@ -1,6 +1,11 @@
 {
     "MIDI_IN": "Launchkey Mini MK3 MIDI Port",
+    "CLOCK_IN": "Launchkey Mini MK3 MIDI Port",
     "MIDI_OUT": "IAC Driver Bus 1",
+    "CLOCK_OUT_CHAN":9,
+    "AI_OUT_CHAN":1,
+    "MUSICIAN_OUT_CHAN":0,
+
     "METER": 4,
     "MAX_BARS": 4,
     "MAX_NOTES": 256,

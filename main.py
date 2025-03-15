@@ -21,6 +21,12 @@ def transport(send_pipe, recv_pipe):
     METER = cfg['METER']
     MAX_BARS = cfg['MAX_BARS']
     VERBOSE = cfg['VERBOSE']
+    CLOCK_IN = cfg['CLOCK_IN']
+
+    CLOCK_OUT_CHAN = cfg['CLOCK_OUT_CHAN']
+    AI_OUT_CHAN = cfg['AI_OUT_CHAN']
+    MUSICIAN_OUT_CHAN = cfg['MUSICIAN_OUT_CHAN']
+
     start_time = time.time()
     tick_start = time.time()
     tick = avg_delta = beat = 0
@@ -76,9 +82,9 @@ def transport(send_pipe, recv_pipe):
                     # Sending notes
                     if VERBOSE:
                         print('click', bars_played_ai, bars_played_user)
-                        outport.send(mido.Message('note_on', note=pitch, velocity=100, channel=9))
+                        outport.send(mido.Message('note_on', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
                         time.sleep(0.01)
-                        outport.send(mido.Message('note_off', note=pitch, velocity=100, channel=9))
+                        outport.send(mido.Message('note_off', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
 
                     
                     note = pretty_midi.Note(
@@ -101,13 +107,13 @@ def transport(send_pipe, recv_pipe):
             if bars_played_ai == MAX_BARS + 1:
                 bars_played_ai = 0 
                 for note_ in notes_to_play[:]:
-                    if note_[1] == 'note_off' and note_[-1].velocity == 0 and note_[-1] in active_ai_notes.keys():
-                        start, velocity = active_notes.pop(note_[-1].pitch)
-                        outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity))
+                    if note_[1] == 'note_off' and note_[-1].pitch in active_ai_notes.keys():
+                        start, velocity = active_ai_notes.pop(note_[-1].pitch)
+                        outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity, channel=AI_OUT_CHAN))
                         notes_to_play.remove(note_)
                         note = pretty_midi.Note(
                             velocity=velocity,
-                            pitch=msg.note,
+                            pitch=note_[-1].pitch,
                             start=start,
                             end=(time.time() - start_time) 
                         )
@@ -140,15 +146,15 @@ def transport(send_pipe, recv_pipe):
                     if note_[0] < (time.time() - start_time):
                         if note_[1] == 'note_on' and note_[-1].velocity > 0:
                             active_ai_notes[note_[-1].pitch] = ((time.time() - start_time), note_[-1].velocity)
-                            outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity))
+                            outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity, channel=AI_OUT_CHAN))
                             notes_to_play.remove(note_)
-                        if note_[1] == 'note_off' and note_[-1].velocity == 0 and note_[-1] in active_ai_notes.keys():
-                            start, velocity = active_notes.pop(note_[-1].pitch)
-                            outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity))
+                        if note_[1] == 'note_off' and note_[-1].pitch in active_ai_notes.keys():
+                            start, velocity = active_ai_notes.pop(note_[-1].pitch)
+                            outport.send(mido.Message(note_[1], note=note_[-1].pitch, velocity=note_[-1].velocity, channel=AI_OUT_CHAN))
                             notes_to_play.remove(note_)
                             note = pretty_midi.Note(
                                 velocity=velocity,
-                                pitch=msg.note,
+                                pitch=note_[-1].pitch,
                                 start=start,
                                 end=(time.time() - start_time) 
                             )
