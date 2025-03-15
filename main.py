@@ -81,11 +81,17 @@ def transport(send_pipe, recv_pipe):
     with open('./cfg.json', 'r') as f:
         cfg = json.load(f)
     MIDI_IN = cfg['MIDI_IN']
+    CLOCK_IN = cfg['CLOCK_IN']
     MIDI_OUT = cfg['MIDI_OUT']
     PPQN = cfg['PPQN']
     METER = cfg['METER']
     MAX_BARS = cfg['MAX_BARS']
     VERBOSE = cfg['VERBOSE']
+
+    CLOCK_OUT_CHAN = cfg['CLOCK_OUT_CHAN']
+    AI_OUT_CHAN = cfg['AI_OUT_CHAN']
+    MUSICIAN_OUT_CHAN = cfg['MUSICIAN_OUT_CHAN']
+
 
     abs_time = None
     tick_start = None
@@ -99,166 +105,172 @@ def transport(send_pipe, recv_pipe):
     notes_to_play = []
     tempo_mics = 1
 
-    with mido.open_input(MIDI_IN) as inport, mido.open_output(MIDI_OUT) as outport:
+    with mido.open_input(CLOCK_IN) as clock_port, mido.open_input(MIDI_IN) as inport, mido.open_output(MIDI_OUT) as outport:
         avg_delta = 0
         tick = 0
         beat = 0
-        for msg in inport:
-            if recv_pipe.poll(0.001):
-                data = recv_pipe.recv()
-                notes_to_play.extend(data)
-                notes_to_play.sort(key = lambda x: x.time)
-            # Handle pipe inputs
-            if msg.type == 'clock':
-                if abs_time is None:
-                    abs_time = time.time()
-                if tick_start is None:
-                    tick_start = time.time()
+        print('starting')
+        while True:
+            for port in (clock_port, inport):
+                for msg in port.iter_pending():
+                    if recv_pipe.poll(0.001):
+                        data = recv_pipe.recv()
+                        notes_to_play.extend(data)
+                        notes_to_play.sort(key = lambda x: x.time)
+                    # Handle pipe inputs
+                    if msg.type == 'clock' and port.name == CLOCK_IN:
+                        if abs_time is None:
+                            abs_time = time.time()
+                        if tick_start is None:
+                            tick_start = time.time()
 
-                delta = time.time() - tick_start
-                avg_delta += delta
+                        delta = time.time() - tick_start
+                        avg_delta += delta
 
-                if (tick + 1) % PPQN == 0:
-                    tick = 0
-                    bpm = round(60 / avg_delta, 0)
-                    tempo_mics = (60 / bpm) * 1000000
-                    avg_delta = 0
+                        if (tick + 1) % PPQN == 0:
+                            tick = 0
+                            bpm = round(60 / avg_delta, 0)
+                            tempo_mics = (60 / bpm) * 1000000
+                            avg_delta = 0
 
-                    time_ = time.time() - abs_time
-                    if beat % METER == 0:
-                        pitch = 75
-                        last_tick_time = mido.second2tick(time_, PPQN, (60 / bpm) * 1000000) - PPQN
-                        if active_player_bars > 0:
-                            active_player_bars += 1
-                        if active_ai_bars >= 0:
-                            active_ai_bars += 1
-                    else:
-                        pitch = 56
+                            time_ = time.time() - abs_time
+                            if beat % METER == 0:
+                                pitch = 75
+                                last_tick_time = mido.second2tick(time_, PPQN, (60 / bpm) * 1000000) - PPQN
+                                if active_player_bars > 0:
+                                    active_player_bars += 1
+                                if active_ai_bars >= 0:
+                                    active_ai_bars += 1
+                            else:
+                                pitch = 56
 
-                    if beat % METER == 0 and beat != 0:
-                        beat = 0
-                    beat += 1
+                            if beat % METER == 0 and beat != 0:
+                                beat = 0
+                            beat += 1
 
-                    # Sending notes
-                    if VERBOSE:
-                        outport.send(mido.Message('note_on', note=pitch, velocity=100, channel=9))
-                        time.sleep(0.01)
-                        outport.send(mido.Message('note_off', note=pitch, velocity=100, channel=9))
-                    
-                    note = Note(
-                        velocity=100,
-                        pitch=pitch,
-                        start=mido.second2tick(
-                            time_, 
-                            PPQN, 
-                            tempo_mics
-                        ),
-                        end=mido.second2tick(
-                            time_ + (60 / bpm), 
-                            PPQN, 
-                            tempo_mics
-                        ),
-                        channel=9
-                    )
+                            # Sending notes
+                            if VERBOSE:
+                                outport.send(mido.Message('note_on', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
+                                time.sleep(0.01)
+                                outport.send(mido.Message('note_off', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
+                            
+                            note = Note(
+                                velocity=100,
+                                pitch=pitch,
+                                start=mido.second2tick(
+                                    time_, 
+                                    PPQN, 
+                                    tempo_mics
+                                ),
+                                end=mido.second2tick(
+                                    time_ + (60 / bpm), 
+                                    PPQN, 
+                                    tempo_mics
+                                ),
+                                channel=9
+                            )
 
-                    send_pipe.send(('click', note))
+                            send_pipe.send(('click', note))
 
-                tick += 1
-                tick_start = time.time()
+                        tick += 1
+                        tick_start = time.time()
 
-            if active_player_bars == MAX_BARS + 1:
-                for note, (start, velocity) in active_notes.items():
-                    note = Note(
-                        velocity=velocity,
-                        pitch=note,
-                        start=mido.second2tick(
-                            start, 
-                            PPQN, 
-                            tempo_mics
-                        ),
-                        end=mido.second2tick(
-                            time.time() - abs_time, 
-                            PPQN, 
-                            tempo_mics
-                        ),
-                        channel=0
-                    )
-
-                    send_pipe.send(('piano', note))
-                send_pipe.send(('start_ai', last_tick_time))
-                active_ai_bars = 0
-                notes_to_play = []
-                active_player_bars = -1
-            
-            if active_ai_bars == MAX_BARS + 1:
-                send_pipe.send(('stop_ai', ''))
-                for note_ in notes_to_play[:]:
-                    if note_.type == 'note_off' and note_.note in active_ai_notes.keys():
-                        start, velocity = active_ai_notes.pop(note_.note)
-                        outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
-                        notes_to_play.remove(note_)
-                        note = Note(
-                            velocity=velocity,
-                            pitch=note_.note,
-                            start=mido.second2tick(start, PPQN, tempo_mics),
-                            end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
-                            channel=0
-                        )
-
-                        send_pipe.send(('piano', note))
-                active_ai_bars = -1
-                active_player_bars = 0
-                notes_to_play = []
-
-            if msg.type in ['note_on', 'note_off']:
-
-                if msg.type == 'note_on' and msg.velocity > 0 and active_player_bars >= 0 and active_player_bars <= MAX_BARS:
-                    active_notes[msg.note] = (time.time() - abs_time, msg.velocity)
-                    outport.send(msg)
-                    if active_player_bars == 0:
-                        active_player_bars += 1
-
-                elif msg.type == 'note_off' or msg.velocity == 0 and msg.note in active_notes and active_player_bars >= 0 and active_player_bars <= MAX_BARS:
-                    outport.send(msg)
-                    start, velocity = active_notes.pop(msg.note)
-                    note = Note(
-                        velocity=velocity,
-                        pitch=msg.note,
-                        start=mido.second2tick(
-                            start, 
-                            PPQN, 
-                            tempo_mics
-                        ),
-                        end=mido.second2tick(
-                            time.time() - abs_time, 
-                            PPQN, 
-                            tempo_mics
-                        ),
-                        channel=0
-                    )
-
-                    send_pipe.send(('piano', note))
-
-            if active_ai_bars >= 0:
-                for note_ in notes_to_play[:]:
-                    if note_.time < (time.time() - abs_time):
-                        if note_.type == 'note_on' and note_.velocity > 0:
-                            active_ai_notes[note_.note] = ((time.time() - abs_time), note_.velocity)
-                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity, channel=1))
-                            notes_to_play.remove(note_)
-                        if note_.type == 'note_off' and note_.note in active_ai_notes.keys():
-                            start, velocity = active_ai_notes.pop(note_.note)
-                            outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity, channel=1))
-                            notes_to_play.remove(note_)
+                    if active_player_bars == MAX_BARS + 1:
+                        for note, (start, velocity) in active_notes.items():
+                            outport.send(mido.Message('note_off', note=note, velocity=velocity, channel=MUSICIAN_OUT_CHAN))
                             note = Note(
                                 velocity=velocity,
-                                pitch=note_.note,
-                                start=mido.second2tick(start, PPQN, tempo_mics),
-                                end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
+                                pitch=note,
+                                start=mido.second2tick(
+                                    start, 
+                                    PPQN, 
+                                    tempo_mics
+                                ),
+                                end=mido.second2tick(
+                                    time.time() - abs_time, 
+                                    PPQN, 
+                                    tempo_mics
+                                ),
                                 channel=0
                             )
 
                             send_pipe.send(('piano', note))
+                        send_pipe.send(('start_ai', last_tick_time))
+                        active_ai_bars = 0
+                        notes_to_play = []
+                        active_player_bars = -1
+                    
+                    if active_ai_bars == MAX_BARS + 1:
+                        send_pipe.send(('stop_ai', ''))
+                        for note_ in notes_to_play[:]:
+                            if note_.type == 'note_off' and note_.velocity == 0 and note_.note in active_ai_notes.keys():
+                                start, velocity = active_notes.pop(note_.note)
+                                outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity, channel=AI_OUT_CHAN))
+                                notes_to_play.remove(note_)
+                                note = Note(
+                                    velocity=velocity,
+                                    pitch=msg.note,
+                                    start=mido.second2tick(start, PPQN, tempo_mics),
+                                    end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
+                                    channel=0
+                                )
+
+                                send_pipe.send(('piano', note))
+                        active_ai_bars = -1
+                        active_player_bars = 0
+                        notes_to_play = []
+
+                    if msg.type in ['note_on', 'note_off']:
+
+                        if msg.type == 'note_on' and msg.velocity > 0 and active_player_bars >= 0 and active_player_bars <= MAX_BARS:
+                            active_notes[msg.note] = (time.time() - abs_time, msg.velocity)
+                            msg.channel = MUSICIAN_OUT_CHAN
+                            outport.send(msg)
+                            if active_player_bars == 0:
+                                active_player_bars += 1
+
+                        elif msg.type == 'note_off' or msg.velocity == 0 and msg.note in active_notes and active_player_bars >= 0 and active_player_bars <= MAX_BARS:
+                            msg.channel = MUSICIAN_OUT_CHAN
+                            outport.send(msg)
+                            start, velocity = active_notes.pop(msg.note)
+                            note = Note(
+                                velocity=velocity,
+                                pitch=msg.note,
+                                start=mido.second2tick(
+                                    start, 
+                                    PPQN, 
+                                    tempo_mics
+                                ),
+                                end=mido.second2tick(
+                                    time.time() - abs_time, 
+                                    PPQN, 
+                                    tempo_mics
+                                ),
+                                channel=0
+                            )
+
+                            send_pipe.send(('piano', note))
+
+                    if active_ai_bars >= 0:
+                        for note_ in notes_to_play[:]:
+                            if note_.time < (time.time() - abs_time):
+                                if note_.type == 'note_on' and note_.velocity > 0:
+                                    active_ai_notes[note_.note] = ((time.time() - abs_time), note_.velocity)
+                                    outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity, channel=AI_OUT_CHAN))
+                                    notes_to_play.remove(note_)
+                                if note_.type == 'note_off' and note_.note in active_ai_notes.keys():
+                                    start, velocity = active_ai_notes.pop(note_.note)
+                                    outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity, channel=AI_OUT_CHAN))
+                                    notes_to_play.remove(note_)
+                                    note = Note(
+                                        velocity=velocity,
+                                        pitch=note_.note,
+                                        start=mido.second2tick(start, PPQN, tempo_mics),
+                                        end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
+                                        channel=0
+                                    )
+
+                                    send_pipe.send(('piano', note))
 
 def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
     piano_notes = []
@@ -269,8 +281,6 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
     while True:
         if receive_AI.poll(0.001):
             decoded = receive_AI.recv()
-
-            print(decoded)
 
             mido_stack = []
             for token in decoded.split('|'):
@@ -288,7 +298,6 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                         ))
                     
                         last_tick_time += st_time
-            print(mido_stack)
             if len(mido_stack) > 0:
                 send_transport.send(mido_stack)
 
@@ -422,12 +431,8 @@ def AI_Processor(send_pipe, recv_pipe):
 
             if '|' in coll:
                 generated_notes += 1
-                print(coll)
                 send_pipe.send(coll)
                 played_ += ins[:, len(decoded_tokens) + played_:].cpu().detach().shape[1]
-
-
-
 
 if __name__ == "__main__":
     p1_to_p2_recv, p1_to_p2_send = multiprocessing.Pipe(duplex=False)
