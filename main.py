@@ -193,13 +193,13 @@ def transport(send_pipe, recv_pipe):
             if active_ai_bars == MAX_BARS + 1:
                 send_pipe.send(('stop_ai', ''))
                 for note_ in notes_to_play[:]:
-                    if note_.type == 'note_off' and note_.velocity == 0 and note_.note in active_ai_notes.keys():
-                        start, velocity = active_notes.pop(note_.note)
+                    if note_.type == 'note_off' and note_.note in active_ai_notes.keys():
+                        start, velocity = active_ai_notes.pop(note_.note)
                         outport.send(mido.Message(note_.type, note=note_.note, velocity=note_.velocity))
                         notes_to_play.remove(note_)
                         note = Note(
                             velocity=velocity,
-                            pitch=msg.note,
+                            pitch=note_.note,
                             start=mido.second2tick(start, PPQN, tempo_mics),
                             end=mido.second2tick((time.time() - abs_time), PPQN, tempo_mics),
                             channel=0
