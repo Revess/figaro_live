@@ -41,7 +41,7 @@ def transport(send_pipe, recv_pipe):
     active_notes = {}
     active_ai_notes = {}
     bars_played_user = 0
-    bars_played_ai = 0
+    bars_played_ai = -1
     send_to_ai = False
     notes_to_play = []
     sort = False
@@ -56,7 +56,6 @@ def transport(send_pipe, recv_pipe):
                         res = recv_pipe.recv()
                         if isinstance(res, str):
                             if res == 'done':
-                                send_to_ai = False
                                 bars_played_user = 0
                         elif isinstance(res, tuple):
                             if ai_turn:
@@ -79,9 +78,9 @@ def transport(send_pipe, recv_pipe):
                             time_ = time.time() - start_time
                             if beat % METER == 0:
                                 pitch = 75
-                                if bars_played_user >= 1:
+                                if bars_played_user > 0:
                                     bars_played_user += 1
-                                if bars_played_ai >= 1:
+                                if bars_played_ai >= 0:
                                     bars_played_ai += 1
                             else:
                                 pitch = 56
@@ -110,7 +109,7 @@ def transport(send_pipe, recv_pipe):
                         tick += 1
                         tick_start = time.time()
 
-                    if bars_played_user == MAX_BARS + 1 and not send_to_ai:
+                    if bars_played_user == MAX_BARS + 1:
                         for note, (start, velocity) in active_notes.items():
                             msg = mido.Message('note_off', note=note, velocity=velocity, channel=MUSICIAN_OUT_CHAN)
                             outport.send(msg)
@@ -123,11 +122,13 @@ def transport(send_pipe, recv_pipe):
 
                             send_pipe.send(('piano', note))
                         send_pipe.send('start_ai')
-                        send_to_ai = True
+                        bars_played_user = -1
+                        bars_played_ai = 1
+                        notes_to_play = []
                         ai_turn = True
                     
                     if bars_played_ai == MAX_BARS + 1:
-                        bars_played_ai = 0 
+                        send_pipe.send('stop_ai')
                         for note_ in notes_to_play[:]:
                             if note_[1] == 'note_off' and note_[-1].pitch in active_ai_notes.keys():
                                 start, velocity = active_ai_notes.pop(note_[-1].pitch)
@@ -143,29 +144,31 @@ def transport(send_pipe, recv_pipe):
                                 send_pipe.send(('piano', note))
                         notes_to_play = []
                         ai_turn = False
+                        bars_played_user = 0
+                        bars_played_ai = -1
                         
-                    if msg.type == 'note_on' and msg.velocity > 0 and not send_to_ai:
-                        msg.channel = MUSICIAN_OUT_CHAN
-                        bars_played_ai = 0
-                        outport.send(msg)
-                        active_notes[msg.note] = ((time.time() - start_time), msg.velocity)
-                        if bars_played_user == 0:
-                            bars_played_user += 1
+                    if msg.type in ['note_on', 'note_off'] and bars_played_user >= 0 and bars_played_user <= MAX_BARS:
+                        if msg.type == 'note_on' and msg.velocity > 0:
+                            msg.channel = MUSICIAN_OUT_CHAN
+                            outport.send(msg)
+                            active_notes[msg.note] = ((time.time() - start_time), msg.velocity)
+                            if bars_played_user == 0:
+                                bars_played_user += 1
 
-                    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0) and msg.note in active_notes.keys() and not send_to_ai:
-                        msg.channel = MUSICIAN_OUT_CHAN
-                        outport.send(msg)
-                        start, velocity = active_notes.pop(msg.note)
-                        note = pretty_midi.Note(
-                            velocity=velocity,
-                            pitch=msg.note,
-                            start=start,
-                            end=(time.time() - start_time) 
-                        )
+                        elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0) and msg.note in active_notes.keys():
+                            msg.channel = MUSICIAN_OUT_CHAN
+                            outport.send(msg)
+                            start, velocity = active_notes.pop(msg.note)
+                            note = pretty_midi.Note(
+                                velocity=velocity,
+                                pitch=msg.note,
+                                start=start,
+                                end=(time.time() - start_time) 
+                            )
 
-                        send_pipe.send(('piano', note))
+                            send_pipe.send(('piano', note))
 
-                    if ai_turn:
+                    if bars_played_ai >= 0:
                         for note_ in notes_to_play[:]:
                             if note_[0] < (time.time() - start_time):
                                 if note_[1] == 'note_on' and note_[-1].velocity > 0:
@@ -184,8 +187,6 @@ def transport(send_pipe, recv_pipe):
                                     )
 
                                     send_pipe.send(('piano', note))
-                                if bars_played_ai == 0:
-                                    bars_played_ai += 1
             time.sleep(0.00001)
 
 def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
@@ -197,10 +198,7 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
     while True:
         if receive_AI.poll(0.001):
             data = receive_AI.recv()
-            if isinstance(data, str):
-                if data == 'done':
-                    send_transport.send('done')
-            elif isinstance(data, list):
+            if isinstance(data, list):
                 converted_ = remi2midi(data)
                 # This needs to be fixed properly
                 for instrument in converted_.instruments:
@@ -253,6 +251,8 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                     pm.instruments.append(click_track)
 
                     send_AI.send(pm)
+                elif data == 'stop_ai':
+                    send_AI.send("stop")
                 # send_transport.send('done')
             elif isinstance(data, tuple):
                 if data[0] == 'click':
@@ -288,6 +288,8 @@ def AI_Processor(send_pipe, recv_pipe):
 
     while True:
         pm = recv_pipe.recv()
+        if isinstance(pm, str):
+            continue
         x = get_features(pm)
         batch = {k:((v[None, :] if len(v.size()) == 1 else v) if isinstance(v,torch.Tensor) else v) for k,v in x.items()}
 
@@ -321,6 +323,10 @@ def AI_Processor(send_pipe, recv_pipe):
         curr_bars = torch.zeros(batch_size).to(model.device).fill_(-1)
 
         for i in range(curr_len - 1, max_len):
+            if recv_pipe.poll(0.001):
+                if recv_pipe.recv() == "stop":
+                    break
+
             x_ = x[:, -model.context_size:].to(model.device)
             bar_ids_ = bar_ids[:, -model.context_size:].to(model.device)
             position_ids_ = position_ids[:, -model.context_size:].to(model.device)
