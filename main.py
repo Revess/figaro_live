@@ -150,6 +150,7 @@ def transport(send_pipe, recv_pipe):
 
                             # Sending notes
                             if VERBOSE:
+                                print('click', active_ai_bars, active_player_bars)
                                 outport.send(mido.Message('note_on', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
                                 time.sleep(0.01)
                                 outport.send(mido.Message('note_off', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
@@ -196,7 +197,7 @@ def transport(send_pipe, recv_pipe):
 
                             send_pipe.send(('piano', note))
                         send_pipe.send(('start_ai', last_tick_time))
-                        active_ai_bars = 0
+                        active_ai_bars = 1
                         notes_to_play = []
                         active_player_bars = -1
                     
