@@ -392,35 +392,35 @@ def AI_Processor(send_pipe, recv_pipe):
                 send_pipe.send('done')
                 break
 
-        played_notes = []
-        played_clicks = []
-        decoded = model.vocab.decode(x.clone().detach().cpu()[0])
+        # played_notes = []
+        # played_clicks = []
+        # decoded = model.vocab.decode(x.clone().detach().cpu()[0])
         
-        pm = pretty_midi.PrettyMIDI()
-        time_sig = pretty_midi.containers.TimeSignature(numerator=4, denominator=4, time=0)
-        pm.time_signature_changes.append(time_sig)
+        # pm = pretty_midi.PrettyMIDI()
+        # time_sig = pretty_midi.containers.TimeSignature(numerator=4, denominator=4, time=0)
+        # pm.time_signature_changes.append(time_sig)
 
-        piano_x = pretty_midi.Instrument(program=0)
-        click_track_x = pretty_midi.Instrument(program=9)
+        # piano_x = pretty_midi.Instrument(program=0)
+        # click_track_x = pretty_midi.Instrument(program=9)
 
-        for i in range(len(decoded)):
-            pm = remi2midi(decoded[:i])
-            for instrument in pm.instruments:
-                if instrument.program == 0:
-                    for note in instrument.notes:
-                        if not any(all([note.start == inst.start, note.end == inst.end, note.pitch == inst.pitch, note.velocity == inst.velocity]) for inst in played_notes):
-                            played_notes.append(note)
-                            piano_x.notes.append(note)
-                if instrument.program == 9:
-                    for note in instrument.notes:
-                        if not any(all([note.start == inst.start, note.end == inst.end, note.pitch == inst.pitch, note.velocity == inst.velocity]) for inst in played_clicks):
-                            played_clicks.append(note)
-                            click_track_x.notes.append(note)
+        # for i in range(len(decoded)):
+        #     pm = remi2midi(decoded[:i])
+        #     for instrument in pm.instruments:
+        #         if instrument.program == 0:
+        #             for note in instrument.notes:
+        #                 if not any(all([note.start == inst.start, note.end == inst.end, note.pitch == inst.pitch, note.velocity == inst.velocity]) for inst in played_notes):
+        #                     played_notes.append(note)
+        #                     piano_x.notes.append(note)
+        #         if instrument.program == 9:
+        #             for note in instrument.notes:
+        #                 if not any(all([note.start == inst.start, note.end == inst.end, note.pitch == inst.pitch, note.velocity == inst.velocity]) for inst in played_clicks):
+        #                     played_clicks.append(note)
+        #                     click_track_x.notes.append(note)
 
-        pm.instruments.append(piano_x)
-        pm.instruments.append(click_track_x)
+        # pm.instruments.append(piano_x)
+        # pm.instruments.append(click_track_x)
 
-        pm.write('./res.midi')
+        # pm.write('./res.midi')
 
 if __name__ == "__main__":
     p1_to_p2_recv, p1_to_p2_send = multiprocessing.Pipe(duplex=False)
