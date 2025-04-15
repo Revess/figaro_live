@@ -13,7 +13,7 @@ Executing:
 Do edit the cfg.json beforehand!
 ```
 {
-    "MIDI_IN": "Launchkey Mini MK3 MIDI Port",
+    "MIDI_IN": "Launchkey Mini MK3 MIDI Port", 
     "MIDI_OUT": "IAC Driver Bus 1",
     "METER": 4,
     "MAX_BARS": 4,
