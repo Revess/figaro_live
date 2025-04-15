@@ -8,7 +8,7 @@ For the musenet model:
 ```git checkout musenet```
 
 Executing:
-```python main.py```
+```python main.py```  
 
 Do edit the cfg.json beforehand!
 ```
