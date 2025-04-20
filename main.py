@@ -4,6 +4,8 @@ import multiprocessing
 import time
 import json
 import torch
+import math
+import os
 from figaro.live_utils import load_model, get_features, sample
 from figaro.input_representation import remi2midi
 from copy import deepcopy
@@ -12,6 +14,10 @@ from copy import deepcopy
 # Check out notochord, maybe it is better and more useful.
 # 
 
+# TODO:
+# - Find a clever way to sync Figaro to the clock
+# - Send out triggers for listening
+
 # with mido.open_input('Teensy MIDI Port 1') as clock_port, mido.open_input('Launchkey Mini MK3 MIDI Port') as inport, mido.open_output('IAC Driver Bus 1') as outport:
 #     while True:
 #         for port in (clock_port, inport):
@@ -19,6 +25,247 @@ from copy import deepcopy
 #                 print(msg, port.name)
 #                 outport.send(msg)
 #         time.sleep(0.001)  # small sleep to prevent high CPU usage
+
+def calculate_certainty(logits, temperature=1.0):
+    # Softmax over logits
+    pr = torch.nn.functional.softmax(logits / temperature, dim=-1)
+    
+    # Compute entropy (uncertainty)
+    entropy = -torch.sum(pr * torch.log(pr + 1e-10), dim=-1)  # add small epsilon to avoid log(0)
+    
+    # Certainty is the inverse of entropy
+    certainty = 1.0 - (entropy / torch.log(torch.tensor(pr.size(-1), dtype=torch.float32)))
+    
+    return certainty
+
+
+def map_value(input_value, input_min=60, input_max=170, output_min=0, output_max=127, prec = 'int'):
+    scaled_value = ((input_value - input_min) * (output_max - output_min)) / (input_max - input_min) + output_min
+    if prec == 'int':
+        return int(scaled_value)
+    else:
+        return scaled_value
+
+def reverse_map_value(scaled_value, input_min=60, input_max=170, output_min=0, output_max=127):
+    input_value = ((scaled_value - output_min) * (input_max - input_min)) / (output_max - output_min) + input_min
+    return input_value
+
+def scale_note_times(note, scaling_factor):
+    note.start *= scaling_factor
+    note.end *= scaling_factor
+    return note
+
+def scale_back_note_times(note, scaling_factor):
+    note.start /= scaling_factor
+    note.end /= scaling_factor
+    return note
+
+def get_prompt(filepath, target_ppqn, target_bpm, meter = 4):
+    """
+    Reads a MIDI file, extracts notes, rescales timing to target PPQN and BPM,
+    generates a click track, and calculates the start time of the next measure.
+
+    Args:
+        filepath (str): Path to the MIDI file.
+        target_ppqn (int): The desired Pulses Per Quarter Note for output interpretation.
+        target_bpm (float): The desired Beats Per Minute for output interpretation.
+        meter (int): The number of beats per measure (e.g., 4 for 4/4 time). Defaults to 4.
+
+    Returns:
+        tuple: A tuple containing:
+            - list[pretty_midi.Note]: List of notes from the MIDI file.
+            - list[pretty_midi.Note]: List of notes representing the click track.
+            - float: Total duration of the track in seconds based on target BPM.
+            - float: Time offset (in seconds) for the start of the measure
+                     immediately following the last event.
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"MIDI file not found: {filepath}")
+    if meter <= 0:
+        raise ValueError("Meter (beats per measure) must be positive.")
+    if target_bpm <= 0:
+        print("Warning: Target BPM is zero or negative. Click track and time offset calculation will be skipped.")
+        # Allow processing notes, but click/offset is meaningless
+        # target_bpm = 0 # Or raise error? For now, proceed but skip calcs.
+
+    notes_list = []
+    click_track_list = []
+    active_notes = {}  # Store start times (in target ticks) of active notes: {(channel, pitch): start_tick}
+    max_time_sec = 0.0 # Track the timestamp of the *end* of the last note or event
+
+    try:
+        mid = mido.MidiFile(filepath)
+    except Exception as e:
+        raise IOError(f"Could not read MIDI file {filepath}: {e}")
+
+    original_ppqn = mid.ticks_per_beat
+    if not original_ppqn or original_ppqn <= 0:
+        print(f"Warning: MIDI file '{filepath}' has invalid ticks_per_beat ({original_ppqn}). Assuming 96.")
+        original_ppqn = 96
+
+    ppqn_ratio = float(target_ppqn) / original_ppqn if original_ppqn else 0 # Avoid division by zero
+    target_tempo_usec = mido.bpm2tempo(target_bpm) if target_bpm > 0 else 0
+
+    print(f"Processing '{filepath}'...")
+    print(f"Original PPQN: {original_ppqn}, Target PPQN: {target_ppqn}, Target BPM: {target_bpm}, Meter: {meter}/4") # Assuming /4 for print
+    print(f"PPQN Ratio: {ppqn_ratio:.4f}, Target Tempo (usec/beat): {target_tempo_usec}")
+
+    current_tempo_usec = 500000 # Default MIDI tempo (120 BPM) if none found early
+    # Find initial tempo if set in track 0
+    if mid.type == 1 and len(mid.tracks) > 0:
+         for msg in mid.tracks[0]:
+             if msg.type == 'set_tempo':
+                 current_tempo_usec = msg.tempo
+                 print(f"Found initial tempo in track 0: {mido.tempo2bpm(current_tempo_usec):.2f} BPM")
+                 break
+    # If no set_tempo found, calculate tempo from target_bpm for conversion
+    if current_tempo_usec == 500000 and target_bpm > 0:
+         current_tempo_usec = target_tempo_usec # Use target tempo if no initial tempo found
+
+    for i, track in enumerate(mid.tracks):
+        print(f"--- Processing Track {i} ---")
+        current_time_original_ticks = 0
+
+        for msg in track:
+            current_time_original_ticks += msg.time
+
+            # Handle tempo changes within the track if necessary (more complex)
+            # For this version, we assume a constant target tempo for conversion
+            # if msg.type == 'set_tempo':
+            #     current_tempo_usec = msg.tempo # Update tempo if it changes mid-track
+
+            # Rescale time to target ticks
+            current_time_target_ticks = round(current_time_original_ticks * ppqn_ratio) if ppqn_ratio else 0
+
+            # Convert target ticks to seconds using target PPQN and TARGET BPM/Tempo
+            current_time_sec = 0.0
+            if target_ppqn > 0 and target_tempo_usec > 0:
+                 current_time_sec = mido.tick2second(current_time_target_ticks, target_ppqn, target_tempo_usec)
+
+            note_key = None
+            is_note_on = False
+            is_note_off = False
+            pitch = -1
+            velocity = 0
+
+            if msg.type == 'note_on' and msg.velocity > 0:
+                is_note_on = True
+                pitch = msg.note
+                velocity = msg.velocity
+                note_key = (msg.channel, pitch)
+                max_time_sec = max(max_time_sec, current_time_sec) # Note start updates max time
+
+            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                is_note_off = True
+                pitch = msg.note
+                note_key = (msg.channel, pitch)
+                # Note off time is the crucial one for overall duration
+                max_time_sec = max(max_time_sec, current_time_sec)
+
+            elif msg.is_meta: # Other meta messages might indicate end of track
+                 max_time_sec = max(max_time_sec, current_time_sec)
+
+
+            # --- Handle Note On/Off Logic (modified slightly for clarity) ---
+            if is_note_on:
+                if note_key in active_notes:
+                    # Overlap: Close previous note at the start of the new one
+                    start_tick_prev, start_sec_prev, vel_prev = active_notes.pop(note_key)
+                    end_sec_prev = current_time_sec
+                    if end_sec_prev > start_sec_prev:
+                        notes_list.append(pretty_midi.Note(velocity=vel_prev, pitch=pitch, start=start_sec_prev, end=end_sec_prev))
+                        # print(f"Warning: Note On overlap {note_key} at {current_time_sec:.3f}s. Closing previous.")
+
+                # Store note on info: start tick, start sec, velocity
+                active_notes[note_key] = (current_time_target_ticks, current_time_sec, velocity)
+
+            elif is_note_off:
+                if note_key in active_notes:
+                    start_tick, start_sec, vel = active_notes.pop(note_key)
+                    end_sec = current_time_sec
+
+                    if end_sec > start_sec:
+                        pm_note = pretty_midi.Note(
+                            velocity=vel, # Use stored velocity from note_on
+                            pitch=pitch,
+                            start=start_sec,
+                            end=end_sec
+                        )
+                        notes_list.append(pm_note)
+                    # else: Warn about zero duration if needed
+                # else: Warn about note off for inactive note if needed
+
+        # After processing a track, clear any remaining active notes (notes held until end)
+        # Use the final max_time_sec as their end time
+        keys_to_clear = list(active_notes.keys())
+        for note_key in keys_to_clear:
+             pitch = note_key[1] # Get pitch from key
+             start_tick, start_sec, vel = active_notes.pop(note_key)
+             end_sec = max_time_sec # End note at the very end of the track content
+             if end_sec > start_sec:
+                 print(f"Note {note_key} was still active at end of track. Closing at {max_time_sec:.3f}s.")
+                 notes_list.append(pretty_midi.Note(velocity=vel, pitch=pitch, start=start_sec, end=end_sec))
+
+
+    # --- Calculate Time Offset for Next Measure ---
+    time_offset = 0.0
+    if target_bpm > 0 and meter > 0:
+        seconds_per_beat = 60.0 / target_bpm
+        seconds_per_measure = seconds_per_beat * meter
+
+        if seconds_per_measure > 0:
+            # Find the end time of the measure containing the last event
+            # Ceiling division gives the index of the measure *after* the last event
+            measure_index_after_last = math.ceil(max_time_sec / seconds_per_measure)
+
+            # The offset is the start time of that next measure
+            time_offset = measure_index_after_last * seconds_per_measure
+
+            # Handle tiny floating point inaccuracies near measure boundaries
+            # If max_time_sec is very close to a measure boundary, ceiling might push it
+            # unnecessarily. Let's add a small epsilon check.
+            epsilon = 1e-9
+            measure_boundary_time = (measure_index_after_last -1) * seconds_per_measure
+            if max_time_sec > measure_boundary_time - epsilon and max_time_sec <= measure_boundary_time + epsilon:
+                 # If max_time_sec is essentially AT the previous measure boundary, recalculate
+                 measure_index_containing_last = math.floor(max_time_sec / seconds_per_measure)
+                 time_offset = (measure_index_containing_last + 1) * seconds_per_measure
+
+
+    # --- Generate Click Track ---
+    if target_bpm > 0 and meter > 0:
+        seconds_per_beat = 60.0 / target_bpm
+        # Calculate number of beats up to the END of the measure containing the last note
+        # This ensures the click track covers the full final measure.
+        num_beats_total = math.ceil(time_offset / seconds_per_beat) if seconds_per_beat > 0 else 0
+
+        print(f"\nEffective duration for clicks/offset: {time_offset:.2f} seconds")
+        print(f"Generating click track ({num_beats_total} beats at {target_bpm} BPM, meter={meter})...")
+
+        for i in range(num_beats_total): # Iterate beat by beat
+            click_start_time = i * seconds_per_beat
+            click_end_time = click_start_time + 0.05
+
+            # Ensure click doesn't exceed the calculated offset time (start of next measure)
+            # Although unlikely with short duration, it's good practice.
+            click_end_time = min(click_end_time, time_offset)
+
+            if click_end_time > click_start_time:
+                # Determine pitch based on position in measure
+                if i % meter == 0:
+                    pitch = 75 # Beat 1
+                else:
+                    pitch = 56    # Other beats
+
+                click_note = pretty_midi.Note(
+                    velocity=100,
+                    pitch=pitch,
+                    start=click_start_time,
+                    end=click_end_time
+                )
+                click_track_list.append(click_note)
+
+    return notes_list, click_track_list, time_offset
 
 def transport(send_pipe, recv_pipe):
     with open('./cfg.json', 'r') as f:
@@ -30,6 +277,8 @@ def transport(send_pipe, recv_pipe):
     METER = cfg['METER']
     MAX_BARS = cfg['MAX_BARS']
     VERBOSE = cfg['VERBOSE']
+    BPM = cfg['BPM']
+    COMM_CHANNEL = cfg['robot_settings']['COMM_CHANNEL']
 
     CLOCK_OUT_CHAN = cfg['CLOCK_OUT_CHAN']
     AI_OUT_CHAN = cfg['AI_OUT_CHAN']
@@ -45,9 +294,58 @@ def transport(send_pipe, recv_pipe):
     send_to_ai = False
     notes_to_play = []
     sort = False
+    bpm = 120
     ai_turn = False
+    toggle_response = False
 
-    with mido.open_input(CLOCK_IN) as clock_port, mido.open_input(MIDI_IN) as inport, mido.open_output(MIDI_OUT) as outport:
+    with mido.open_input(CLOCK_IN) as clock_port, mido.open_input(MIDI_IN) as inport, mido.open_output(MIDI_OUT) as outport, mido.open_output(CLOCK_IN) as clock_control:
+        clock_control.send(
+            mido.Message(
+                type = 'control_change', 
+                control = 127,
+                channel = COMM_CHANNEL,
+                value = map_value(BPM),
+                time = 0
+            )
+        )
+        
+        while True:
+            if recv_pipe.poll(0.001):
+                res = recv_pipe.recv()
+                if isinstance(res, str):
+                    if res == 'Done Loading':
+                        clock_control.send(
+                            mido.Message(
+                                type = 'control_change', 
+                                control = 126,
+                                channel = COMM_CHANNEL,
+                                value = 127,
+                                time = 0
+                            )
+                        )
+
+                        clock_control.send(
+                            mido.Message(
+                                type = 'control_change', 
+                                control = 126,
+                                channel = COMM_CHANNEL,
+                                value = 126,
+                                time = 0
+                            )
+                        )
+
+                        clock_control.send(
+                            mido.Message(
+                                type = 'control_change', 
+                                control = 123,
+                                channel = COMM_CHANNEL,
+                                value = 124,
+                                time = 0
+                            )
+                        )
+                        break
+            time.sleep(0.001)
+
         print('starting')
         while True:
             for port in (clock_port, inport):
@@ -59,12 +357,40 @@ def transport(send_pipe, recv_pipe):
                                 bars_played_user = 0
                         elif isinstance(res, tuple):
                             if ai_turn:
-                                notes_to_play.append(res)
-                            sort = True
+                                if res[0] == 'certainty':
+                                    clock_control.send(
+                                        mido.Message(
+                                            type = 'control_change', 
+                                            control = 125,
+                                            channel = COMM_CHANNEL,
+                                            value = map_value(res[1], 0.0, 1.0, 0, 127),
+                                            time = 0
+                                        )
+                                    )
+                                else:
+                                    # Ping this on every AI note that is being received
+                                    clock_control.send(
+                                        mido.Message(
+                                            type = 'control_change', 
+                                            control = 126,
+                                            channel = COMM_CHANNEL,
+                                            value = 124,
+                                            time = 0
+                                        )
+                                    )
+                                    notes_to_play.append(res)
+                                    sort = True
 
                     if sort:
                         notes_to_play.sort(key=lambda event: event[0])
                         sort = False
+
+                    if msg.type =='control_change':
+                        if msg.control == 22:
+                            send_pipe.send(("temperature", map_value(msg.value, 0, 127, 0.1, 1.8, prec='float')))
+                        # if msg.control == 21:
+                        #     msg.channel = COMM_CHANNEL
+                        #     clock_control.send(msg)
 
                     if msg.type == 'clock' and port.name == CLOCK_IN:
                         delta = time.time() - tick_start
@@ -91,12 +417,11 @@ def transport(send_pipe, recv_pipe):
 
                             # Sending notes
                             if VERBOSE:
-                                print('click', bars_played_ai, bars_played_user)
+                                print('click', bars_played_ai, bars_played_user, toggle_response)
                                 outport.send(mido.Message('note_on', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
                                 time.sleep(0.01)
                                 outport.send(mido.Message('note_off', note=pitch, velocity=100, channel=CLOCK_OUT_CHAN))
 
-                            
                             note = pretty_midi.Note(
                                 velocity=100,
                                 pitch=pitch,
@@ -122,6 +447,15 @@ def transport(send_pipe, recv_pipe):
 
                             send_pipe.send(('piano', note))
                         send_pipe.send('start_ai')
+                        clock_control.send(
+                            mido.Message(
+                                type = 'control_change', 
+                                control = 126,
+                                channel = COMM_CHANNEL,
+                                value = 125,
+                                time = 0
+                            )
+                        )
                         bars_played_user = -1
                         bars_played_ai = 1
                         notes_to_play = []
@@ -143,11 +477,23 @@ def transport(send_pipe, recv_pipe):
 
                                 send_pipe.send(('piano', note))
                         notes_to_play = []
+                        clock_control.send(
+                            mido.Message(
+                                type = 'control_change', 
+                                control = 123,
+                                channel = COMM_CHANNEL,
+                                value = 124,
+                                time = 0
+                            )
+                        )
                         ai_turn = False
                         bars_played_user = 0
                         bars_played_ai = -1
                         
                     if msg.type in ['note_on', 'note_off'] and bars_played_user >= 0 and bars_played_user <= MAX_BARS:
+                        if msg.channel == COMM_CHANNEL and msg.type == 'note_on':
+                            if msg.note == 0:
+                                toggle_response = not toggle_response
                         if msg.type == 'note_on' and msg.velocity > 0:
                             msg.channel = MUSICIAN_OUT_CHAN
                             outport.send(msg)
@@ -187,17 +533,35 @@ def transport(send_pipe, recv_pipe):
                                     )
 
                                     send_pipe.send(('piano', note))
+          
             time.sleep(0.00001)
 
 def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
-    piano_notes = []
-    click_notes = []
+    with open('./cfg.json', 'r') as f:
+        cfg = json.load(f)
+    PPQN = cfg['PPQN']
+    METER = cfg['METER']
+    BPM = reverse_map_value(map_value(cfg['BPM']))
+    CTX = cfg['AI_settings']['CTX']
+    prompt_file = cfg['AI_settings']['prompt']
+    if prompt_file != '':
+        piano_notes, click_notes, time_offset = get_prompt('./ACGrand.mid', target_ppqn=PPQN, target_bpm=BPM, meter=METER)
+    else:
+        piano_notes = []
+        click_notes = []
+
     ORG_OFFSET = 0.0
     get_next_offset = False
     played_notes = []
     while True:
         if receive_AI.poll(0.001):
             data = receive_AI.recv()
+            if isinstance(data, str):
+                if data == 'Done Loading':
+                    send_transport.send('Done Loading')
+            if isinstance(data, tuple):
+                if data[0] == 'certainty':
+                    send_transport.send(data)
             if isinstance(data, list):
                 converted_ = remi2midi(data)
                 # This needs to be fixed properly
@@ -243,7 +607,10 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                         note.start -= ORG_OFFSET
                         click_track.notes.append(note)
 
-                    pm = pretty_midi.PrettyMIDI()
+                    pm = pretty_midi.PrettyMIDI(
+                        resolution=PPQN,
+                        initial_tempo=BPM
+                    )
                     time_sig = pretty_midi.containers.TimeSignature(numerator=4, denominator=4, time=0)
                     pm.time_signature_changes.append(time_sig)
 
@@ -259,10 +626,16 @@ def AI_note_manager(send_transport, recv_transport, send_AI, receive_AI):
                     if get_next_offset:
                         ORG_OFFSET = data[1].start
                         get_next_offset = False
+                    data[1].start += time_offset
+                    data[1].end += time_offset
                     click_notes.append(data[1])
+                elif data[0] == 'temperature':
+                    send_AI.send(data)
                 else:
+                    data[1].start += time_offset
+                    data[1].end += time_offset
                     piano_notes.append(data[1])
-                    piano_notes = piano_notes[-256:] # Filter so the piano_notes at most get a ctx of -256
+                    piano_notes = piano_notes[-CTX:] # Filter so the piano_notes at most get a ctx of -256
                     break_point = 0
                     for step, click_ in enumerate(click_notes):
                         if click_.start > piano_notes[0].start:
@@ -286,8 +659,21 @@ def AI_Processor(send_pipe, recv_pipe):
     model, vae_module = load_model('./checkpoints/figaro-expert.ckpt', './checkpoints/vq-vae.ckpt')
     model.to(DEVICE)
 
+    send_pipe.send('Done Loading')
+
     while True:
-        pm = recv_pipe.recv()
+        print('done')
+        data = recv_pipe.recv()
+        if isinstance(data, tuple):
+            if data[0] == 'temperature':
+                temperature = data[1]
+            continue
+        else:
+            pm = data
+            certainty = []
+
+
+        print('start')
         if isinstance(pm, str):
             continue
         x = get_features(pm)
@@ -366,6 +752,12 @@ def AI_Processor(send_pipe, recv_pipe):
             idx = min(model.context_size - 1, i)
             logits = logits[:, idx] / temperature
 
+            certainty = calculate_certainty(logits)
+            certainty.append(certainty.mean().item())  
+            average_certainty = sum(certainty) / len(certainty)
+
+            send_pipe.send(("certainty", average_certainty))
+
             pr = torch.nn.functional.softmax(logits, dim=-1)
             pr = pr.view(-1, pr.size(-1))
 
@@ -395,38 +787,9 @@ def AI_Processor(send_pipe, recv_pipe):
             position_ids = torch.cat([position_ids, next_position_ids.unsqueeze(1)], dim=1)
 
             if torch.all(is_done):
+                print('Processed all bars done')
                 send_pipe.send('done')
                 break
-
-        # played_notes = []
-        # played_clicks = []
-        # decoded = model.vocab.decode(x.clone().detach().cpu()[0])
-        
-        # pm = pretty_midi.PrettyMIDI()
-        # time_sig = pretty_midi.containers.TimeSignature(numerator=4, denominator=4, time=0)
-        # pm.time_signature_changes.append(time_sig)
-
-        # piano_x = pretty_midi.Instrument(program=0)
-        # click_track_x = pretty_midi.Instrument(program=9)
-
-        # for i in range(len(decoded)):
-        #     pm = remi2midi(decoded[:i])
-        #     for instrument in pm.instruments:
-        #         if instrument.program == 0:
-        #             for note in instrument.notes:
-        #                 if not any(all([note.start == inst.start, note.end == inst.end, note.pitch == inst.pitch, note.velocity == inst.velocity]) for inst in played_notes):
-        #                     played_notes.append(note)
-        #                     piano_x.notes.append(note)
-        #         if instrument.program == 9:
-        #             for note in instrument.notes:
-        #                 if not any(all([note.start == inst.start, note.end == inst.end, note.pitch == inst.pitch, note.velocity == inst.velocity]) for inst in played_clicks):
-        #                     played_clicks.append(note)
-        #                     click_track_x.notes.append(note)
-
-        # pm.instruments.append(piano_x)
-        # pm.instruments.append(click_track_x)
-
-        # pm.write('./res.midi')
 
 if __name__ == "__main__":
     p1_to_p2_recv, p1_to_p2_send = multiprocessing.Pipe(duplex=False)

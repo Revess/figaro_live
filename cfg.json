@@ -11,5 +11,14 @@
     "MAX_MEASURES": 2,
     "PPQN": 24,
     "VERBOSE": true,
-    "TEMPERATURE": 1.2
+    "TEMPERATURE": 1.2,
+    "BPM": 120,
+    "AI_settings": {
+        "prompt": "./ACGrand.mid",
+        "CTX": 256
+    },
+    "robot_settings": {
+        "COMM_CHANNEL": 15
+
+    }
 }
